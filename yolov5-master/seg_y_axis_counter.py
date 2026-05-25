@@ -1033,6 +1033,9 @@ LINE_P4_Y = 216
 # LINE_P4_Y = 216
 BUFFER_PX = 10
 BUFFER_SECONDS = 0.2
+MIN_MATCH_IOU = 0.1
+DEDUP_SECONDS = 1.0
+DEDUP_DISTANCE_PX = 50
 STOP_REQUESTED = False
 LINE_POINTS = []
 DRAW_SCALE = 1.0
@@ -1058,9 +1061,12 @@ def point_line_side(px, py, x1, y1, x2, y2):
     return (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
 
 
-def update_conveyor_out_count(cx, cy, tid, cls_name, line_pts, track_state, last_time, count_out, counted_ids):
+def update_conveyor_out_count(
+    cx, cy, tid, cls_name, line_pts, track_state, last_time, count_out, counted_ids,
+    recent_events, dedup_seconds, dedup_distance_px
+):
     if tid in counted_ids:
-        return
+        return False
 
     x1, y1, x2, y2 = line_pts
     side_val = point_line_side(cx, cy, x1, y1, x2, y2)
@@ -1072,12 +1078,24 @@ def update_conveyor_out_count(cx, cy, tid, cls_name, line_pts, track_state, last
 
     # Same rule for all conveyors: count once when side flips across the line.
     if prev_sign != 0 and side_sign != 0 and prev_sign != side_sign and (now - last_t) >= BUFFER_SECONDS:
-        count_out[cls_name] += 1
-        last_time[tid] = now
-        counted_ids.add(tid)
+        is_duplicate = False
+        for ex, ey, et in recent_events:
+            if (now - et) <= dedup_seconds:
+                if ((cx - ex) ** 2 + (cy - ey) ** 2) ** 0.5 <= dedup_distance_px:
+                    is_duplicate = True
+                    break
+
+        if not is_duplicate:
+            count_out[cls_name] += 1
+            last_time[tid] = now
+            counted_ids.add(tid)
+            recent_events.append((cx, cy, now))
+            recent_events[:] = [e for e in recent_events if (now - e[2]) <= dedup_seconds]
+            return True
 
     if side_sign != 0:
         state["last_sign"] = side_sign
+    return False
 
 
 def to_norm_points(p1x, p1y, p2x, p2y, w, h):
@@ -1157,7 +1175,10 @@ def run(
     line_p3_y=LINE_P3_Y,
     line_p4_x=LINE_P4_X,
     line_p4_y=LINE_P4_Y,
-    draw_line=True
+    draw_line=True,
+    persistence_seconds=0.5,
+    dedup_seconds=DEDUP_SECONDS,
+    dedup_distance_px=DEDUP_DISTANCE_PX
 ):
     raw_writer = None
     ann_writer = None
@@ -1178,6 +1199,9 @@ def run(
     window_name = "YOLOv5 Seg Counting"
     norm_c1 = None
     norm_c2 = None
+    persistence_seconds = float(persistence_seconds)
+    dedup_seconds = float(dedup_seconds)
+    dedup_distance_px = float(dedup_distance_px)
 
     try:
         if not os.path.exists(weights):
@@ -1207,6 +1231,10 @@ def run(
         last_time_c2 = {}
         counted_ids_c1 = set()
         counted_ids_c2 = set()
+        counted_ids_global = set()
+        recent_events_c1 = []
+        recent_events_c2 = []
+        first_seen_time = {}
         track_class = {}
 
         for data in tqdm(dataset, desc="Segmentation Counting"):
@@ -1313,12 +1341,15 @@ def run(
                 np.array([d[:5] for d in detections]) if detections else np.empty((0, 5))
             )
 
+            used_det_indices = set()
             for trk in tracks.astype(int):
                 x1, y1, x2, y2, tid = trk
 
                 # Find matching detection
-                best_iou, det = 0, None
-                for d in detections:
+                best_iou, best_idx, det = 0, -1, None
+                for di, d in enumerate(detections):
+                    if di in used_det_indices:
+                        continue
                     xx1, yy1 = max(x1, d[0]), max(y1, d[1])
                     xx2, yy2 = min(x2, d[2]), min(y2, d[3])
                     inter = max(0, xx2 - xx1) * max(0, yy2 - yy1)
@@ -1326,10 +1357,13 @@ def run(
                     area2 = (d[2] - d[0]) * (d[3] - d[1])
                     iou = inter / (area1 + area2 - inter + 1e-6)
                     if iou > best_iou:
-                        best_iou, det = iou, d
+                        best_iou, best_idx, det = iou, di, d
 
                 if det is None:
                     continue
+                if best_iou < MIN_MATCH_IOU:
+                    continue
+                used_det_indices.add(best_idx)
 
                 cls_name = names[det[5]]
                 mask = det[6]
@@ -1338,6 +1372,8 @@ def run(
                 mask = mask.astype(bool)
 
                 track_class.setdefault(tid, cls_name)
+                if tid not in first_seen_time:
+                    first_seen_time[tid] = time.time()
 
                 # Mask centroid
                 ys, xs = np.where(mask)
@@ -1345,16 +1381,23 @@ def run(
                     continue
                 cx = int(xs.mean())
                 cy = int(ys.mean())
-                update_conveyor_out_count(
-                    cx, cy, tid, cls_name,
-                    (p1x, p1y, p2x, p2y),
-                    track_state_c1, last_time_c1, count_out_c1, counted_ids_c1
-                )
-                update_conveyor_out_count(
-                    cx, cy, tid, cls_name,
-                    (p3x, p3y, p4x, p4y),
-                    track_state_c2, last_time_c2, count_out_c2, counted_ids_c2
-                )
+                if (time.time() - first_seen_time[tid]) >= persistence_seconds and tid not in counted_ids_global:
+                    counted_c1 = update_conveyor_out_count(
+                        cx, cy, tid, cls_name,
+                        (p1x, p1y, p2x, p2y),
+                        track_state_c1, last_time_c1, count_out_c1, counted_ids_c1,
+                        recent_events_c1, dedup_seconds, dedup_distance_px
+                    )
+                    counted_c2 = False
+                    if not counted_c1:
+                        counted_c2 = update_conveyor_out_count(
+                            cx, cy, tid, cls_name,
+                            (p3x, p3y, p4x, p4y),
+                            track_state_c2, last_time_c2, count_out_c2, counted_ids_c2,
+                            recent_events_c2, dedup_seconds, dedup_distance_px
+                        )
+                    if counted_c1 or counted_c2:
+                        counted_ids_global.add(tid)
 
                 # Display-only: draw bbox only (no mask fill, no ID text).
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
@@ -1370,28 +1413,28 @@ def run(
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
             y = 40
+            draw_text_with_gold_box(frame, "Conveyor 1", (15, y), (0, 255, 255))
+            y += 34
             for cls in count_out_c1:
                 draw_text_with_gold_box(
                     frame,
-                    f"{cls}",
+                    f"{cls} OUT:{count_out_c1[cls]}",
                     (15, y),
                     get_class_color(cls)
                 )
-                y += 30
+                y += 32
+
+            y += 10
+            draw_text_with_gold_box(frame, "Conveyor 2", (15, y), (255, 255, 0))
+            y += 34
+            for cls in count_out_c2:
                 draw_text_with_gold_box(
                     frame,
-                    f"C1_OUT:{count_out_c1[cls]}",
+                    f"{cls} OUT:{count_out_c2[cls]}",
                     (15, y),
                     get_class_color(cls)
                 )
-                y += 30
-                draw_text_with_gold_box(
-                    frame,
-                    f"C2_OUT:{count_out_c2[cls]}",
-                    (15, y),
-                    get_class_color(cls)
-                )
-                y += 36
+                y += 32
 
             if raw_writer is None:
                 h, w = frame.shape[:2]
@@ -1443,13 +1486,15 @@ def parse_opt():
     parser.add_argument("--line-p4-x", type=int, default=LINE_P4_X, help="line point 4 x (conveyor 2)")
     parser.add_argument("--line-p4-y", type=int, default=LINE_P4_Y, help="line point 4 y (conveyor 2)")
     parser.add_argument("--draw-line", action="store_true", help="draw 2-point line with mouse on first frame")
+    parser.add_argument("--persistence-seconds", type=float, default=0.5, help="minimum tracked time before a crossing can be counted")
+    parser.add_argument("--dedup-seconds", type=float, default=DEDUP_SECONDS, help="suppress duplicate events within this time window")
+    parser.add_argument("--dedup-distance-px", type=float, default=DEDUP_DISTANCE_PX, help="duplicate suppression radius in pixels")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     opt = parse_opt()
     run(**vars(opt))
-
 
 
 
@@ -1536,7 +1581,7 @@ if __name__ == "__main__":
 # import os
 # import pathlib
 # from tqdm import tqdm
-# import signal
+# import signal 
 
 # # ================= WINDOWS PATH FIX =================
 # temp = pathlib.PosixPath
@@ -1560,16 +1605,27 @@ if __name__ == "__main__":
 # # ================= CONFIG =================
 # LINE_X = 1500
 # LINE_Y = 300
-# ROI_X1 = 200
-# ROI_Y1 = 120
-# ROI_X2 = 440
-# ROI_Y2 = 280
+# LINE_P1_X = 161
+# LINE_P1_Y = 501
+# LINE_P2_X = 298
+# LINE_P2_Y = 472
+# LINE_P3_X = 263
+# LINE_P3_Y = 275
+# LINE_P4_X = 231
+# LINE_P4_Y = 216
+
+# ### below are example points for a conveyor belt counting line olam_agri_vid_1
+# # LINE_P1_Y = 501
+# # LINE_P2_X = 298
+# # LINE_P2_Y = 472
+# # LINE_P3_X = 263
+# # LINE_P3_Y = 275
+# # LINE_P4_X = 231
+# # LINE_P4_Y = 216
 # BUFFER_PX = 10
-# BUFFER_SECONDS = 10
+# BUFFER_SECONDS = 0.2
 # STOP_REQUESTED = False
-# DRAWING_ROI = False
-# ROI_START_PT = None
-# ROI_END_PT = None
+# LINE_POINTS = []
 
 
 # def request_stop(sig=None, frame=None):
@@ -1587,21 +1643,31 @@ if __name__ == "__main__":
 #     return tuple(int(c) for c in np.random.randint(40, 255, 3))
 
 
-# def get_track_region(cx, cy, axis, roi):
-#     x1, y1, x2, y2 = roi
-#     if x1 <= cx <= x2 and y1 <= cy <= y2:
-#         return "inside"
-#     if axis == "x":
-#         if cx < x1:
-#             return "left"
-#         if cx > x2:
-#             return "right"
-#     else:
-#         if cy < y1:
-#             return "top"
-#         if cy > y2:
-#             return "bottom"
-#     return "outside"
+# def point_line_side(px, py, x1, y1, x2, y2):
+#     # Cross product sign tells which side of directed line the point lies on.
+#     return (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
+
+
+# def update_conveyor_out_count(cx, cy, tid, cls_name, line_pts, track_state, last_time, count_out, counted_ids):
+#     if tid in counted_ids:
+#         return
+
+#     x1, y1, x2, y2 = line_pts
+#     side_val = point_line_side(cx, cy, x1, y1, x2, y2)
+#     side_sign = 0 if abs(side_val) <= BUFFER_PX else (1 if side_val > 0 else -1)
+#     now = time.time()
+#     last_t = last_time.get(tid, 0)
+#     state = track_state.setdefault(tid, {"last_sign": 0})
+#     prev_sign = state["last_sign"]
+
+#     # Same rule for all conveyors: count once when side flips across the line.
+#     if prev_sign != 0 and side_sign != 0 and prev_sign != side_sign and (now - last_t) >= BUFFER_SECONDS:
+#         count_out[cls_name] += 1
+#         last_time[tid] = now
+#         counted_ids.add(tid)
+
+#     if side_sign != 0:
+#         state["last_sign"] = side_sign
 
 
 # def get_next_video_path(save_dir, prefix):
@@ -1628,17 +1694,12 @@ if __name__ == "__main__":
 #     cv2.putText(img, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
 
 
-# def _roi_mouse_callback(event, x, y, flags, param):
-#     global DRAWING_ROI, ROI_START_PT, ROI_END_PT
+# def _line_mouse_callback(event, x, y, flags, param):
+#     global LINE_POINTS
 #     if event == cv2.EVENT_LBUTTONDOWN:
-#         DRAWING_ROI = True
-#         ROI_START_PT = (x, y)
-#         ROI_END_PT = (x, y)
-#     elif event == cv2.EVENT_MOUSEMOVE and DRAWING_ROI:
-#         ROI_END_PT = (x, y)
-#     elif event == cv2.EVENT_LBUTTONUP:
-#         DRAWING_ROI = False
-#         ROI_END_PT = (x, y)
+#         if len(LINE_POINTS) >= 2:
+#             LINE_POINTS = []
+#         LINE_POINTS.append((x, y))
 
 
 # # ==================================================
@@ -1653,11 +1714,15 @@ if __name__ == "__main__":
 #     project="runs/seg-count",
 #     name="exp",
 #     axis="y",
-#     roi_x1=ROI_X1,
-#     roi_y1=ROI_Y1,
-#     roi_x2=ROI_X2,
-#     roi_y2=ROI_Y2,
-#     draw_roi=True
+#     line_p1_x=LINE_P1_X,
+#     line_p1_y=LINE_P1_Y,
+#     line_p2_x=LINE_P2_X,
+#     line_p2_y=LINE_P2_Y,
+#     line_p3_x=LINE_P3_X,
+#     line_p3_y=LINE_P3_Y,
+#     line_p4_x=LINE_P4_X,
+#     line_p4_y=LINE_P4_Y,
+#     draw_line=True
 # ):
 #     raw_writer = None
 #     ann_writer = None
@@ -1665,12 +1730,16 @@ if __name__ == "__main__":
 #     axis = axis.lower()
 #     if axis not in ("x", "y"):
 #         raise ValueError(f"Invalid axis '{axis}'. Use 'x' or 'y'.")
-#     requested_roi_x1 = int(roi_x1)
-#     requested_roi_y1 = int(roi_y1)
-#     requested_roi_x2 = int(roi_x2)
-#     requested_roi_y2 = int(roi_y2)
-#     roi_warned = False
-#     roi_selected = not bool(draw_roi)
+#     p1x = int(line_p1_x)
+#     p1y = int(line_p1_y)
+#     p2x = int(line_p2_x)
+#     p2y = int(line_p2_y)
+#     p3x = int(line_p3_x)
+#     p3y = int(line_p3_y)
+#     p4x = int(line_p4_x)
+#     p4y = int(line_p4_y)
+#     line_warned = False
+#     line_selected = False
 #     window_name = "YOLOv5 Seg Counting"
 
 #     try:
@@ -1693,10 +1762,14 @@ if __name__ == "__main__":
 
 #         tracker = Sort(max_age=30, min_hits=2, iou_threshold=0.2)
 
-#         count_in = {v: 0 for v in names.values()}
-#         count_out = {v: 0 for v in names.values()}
-#         track_state = {}
-#         last_time = {}
+#         count_out_c1 = {v: 0 for v in names.values()}
+#         count_out_c2 = {v: 0 for v in names.values()}
+#         track_state_c1 = {}
+#         track_state_c2 = {}
+#         last_time_c1 = {}
+#         last_time_c2 = {}
+#         counted_ids_c1 = set()
+#         counted_ids_c2 = set()
 #         track_class = {}
 
 #         for data in tqdm(dataset, desc="Segmentation Counting"):
@@ -1709,47 +1782,50 @@ if __name__ == "__main__":
 #             raw = im0s[0].copy() if isinstance(im0s, list) else im0s.copy()
 #             frame = raw.copy()
 #             h, w = frame.shape[:2]
-#             roi_x1 = max(0, min(requested_roi_x1, w - 1))
-#             roi_x2 = max(0, min(requested_roi_x2, w - 1))
-#             roi_y1 = max(0, min(requested_roi_y1, h - 1))
-#             roi_y2 = max(0, min(requested_roi_y2, h - 1))
-#             if roi_x1 > roi_x2:
-#                 roi_x1, roi_x2 = roi_x2, roi_x1
-#             if roi_y1 > roi_y2:
-#                 roi_y1, roi_y2 = roi_y2, roi_y1
-#             if not roi_warned and (requested_roi_x1 != roi_x1 or requested_roi_x2 != roi_x2 or requested_roi_y1 != roi_y1 or requested_roi_y2 != roi_y2):
-#                 print(f"Warning: ROI was clamped to frame bounds. Using ({roi_x1},{roi_y1})-({roi_x2},{roi_y2}).")
-#                 roi_warned = True
+#             p1x = max(0, min(p1x, w - 1))
+#             p1y = max(0, min(p1y, h - 1))
+#             p2x = max(0, min(p2x, w - 1))
+#             p2y = max(0, min(p2y, h - 1))
+#             p3x = max(0, min(p3x, w - 1))
+#             p3y = max(0, min(p3y, h - 1))
+#             p4x = max(0, min(p4x, w - 1))
+#             p4y = max(0, min(p4y, h - 1))
+#             if not line_warned and ((p1x, p1y) != (int(line_p1_x), int(line_p1_y)) or (p2x, p2y) != (int(line_p2_x), int(line_p2_y))):
+#                 print(f"Warning: Line points clamped to frame bounds. Using ({p1x},{p1y})-({p2x},{p2y}).")
+#                 line_warned = True
 
-#             if not roi_selected:
-#                 global ROI_START_PT, ROI_END_PT, DRAWING_ROI
-#                 ROI_START_PT = (roi_x1, roi_y1)
-#                 ROI_END_PT = (roi_x2, roi_y2)
+#             if not line_selected:
+#                 global LINE_POINTS
+#                 print(f"Conveyor 1 fixed points: P1=({p1x}, {p1y}), P2=({p2x}, {p2y})")
+#                 LINE_POINTS = [(p3x, p3y), (p4x, p4y)]
 #                 cv2.namedWindow(window_name)
-#                 cv2.setMouseCallback(window_name, _roi_mouse_callback)
+#                 cv2.setMouseCallback(window_name, _line_mouse_callback)
 
 #                 while True:
 #                     preview = frame.copy()
-#                     if ROI_START_PT and ROI_END_PT:
-#                         x1p, y1p = ROI_START_PT
-#                         x2p, y2p = ROI_END_PT
-#                         cv2.rectangle(preview, (x1p, y1p), (x2p, y2p), (0, 255, 255), 2)
-#                     cv2.putText(preview, "Draw ROI with mouse, press ENTER to confirm", (15, 30),
+#                     #cv2.line(preview, (p1x, p1y), (p2x, p2y), (0, 255, 255), 2)
+#                     cv2.putText(preview, "Conveyor 1", (p1x, max(20, p1y - 10)),
 #                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+#                     if len(LINE_POINTS) >= 1:
+#                         cv2.circle(preview, LINE_POINTS[0], 4, (255, 255, 0), -1)
+#                     if len(LINE_POINTS) >= 2:
+#                         #cv2.line(preview, LINE_POINTS[0], LINE_POINTS[1], (255, 255, 0), 2)
+#                         cv2.putText(preview, "Conveyor 2", (LINE_POINTS[0][0], max(20, LINE_POINTS[0][1] - 10)),
+#                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+#                     cv2.putText(preview, "Click P3 and P4 for Conveyor 2, ENTER to confirm", (15, 30),
+#                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 #                     cv2.imshow(window_name, preview)
 #                     key = cv2.waitKey(20) & 0xFF
-#                     if key == 13:  # Enter
+#                     if key == 13 and len(LINE_POINTS) == 2:  # Enter
 #                         break
 #                     if key in [27, ord("q")]:
 #                         request_stop()
 #                         break
 
-#                 if ROI_START_PT and ROI_END_PT:
-#                     x1p, y1p = ROI_START_PT
-#                     x2p, y2p = ROI_END_PT
-#                     requested_roi_x1, requested_roi_x2 = sorted([x1p, x2p])
-#                     requested_roi_y1, requested_roi_y2 = sorted([y1p, y2p])
-#                 roi_selected = True
+#                 if len(LINE_POINTS) == 2:
+#                     (p3x, p3y), (p4x, p4y) = LINE_POINTS
+#                     print(f"Selected conveyor 2 points: P3=({p3x}, {p3y}), P4=({p4x}, {p4y})")
+#                 line_selected = True
 
 #             im = torch.from_numpy(im).to(device).float() / 255.0
 #             if im.ndim == 3:
@@ -1774,8 +1850,6 @@ if __name__ == "__main__":
 #             tracks = tracker.update(
 #                 np.array([d[:5] for d in detections]) if detections else np.empty((0, 5))
 #             )
-
-#             now = time.time()
 
 #             for trk in tracks.astype(int):
 #                 x1, y1, x2, y2, tid = trk
@@ -1809,45 +1883,53 @@ if __name__ == "__main__":
 #                     continue
 #                 cx = int(xs.mean())
 #                 cy = int(ys.mean())
-#                 region = get_track_region(cx, cy, axis, (roi_x1, roi_y1, roi_x2, roi_y2))
-#                 last_t = last_time.get(tid, 0)
-#                 side_a, side_b = ("left", "right") if axis == "x" else ("top", "bottom")
-#                 state = track_state.setdefault(tid, {"start_side": None, "entered_roi": False})
+#                 update_conveyor_out_count(
+#                     cx, cy, tid, cls_name,
+#                     (p1x, p1y, p2x, p2y),
+#                     track_state_c1, last_time_c1, count_out_c1, counted_ids_c1
+#                 )
+#                 update_conveyor_out_count(
+#                     cx, cy, tid, cls_name,
+#                     (p3x, p3y, p4x, p4y),
+#                     track_state_c2, last_time_c2, count_out_c2, counted_ids_c2
+#                 )
 
-#                 if region == "inside":
-#                     state["entered_roi"] = True
-#                 elif region in (side_a, side_b):
-#                     if state["start_side"] is None:
-#                         state["start_side"] = region
-#                     elif region != state["start_side"] and state["entered_roi"] and (now - last_t) > BUFFER_SECONDS:
-#                         if state["start_side"] == side_a and region == side_b:
-#                             count_in[cls_name] += 1
-#                         elif state["start_side"] == side_b and region == side_a:
-#                             count_out[cls_name] += 1
-#                         last_time[tid] = now
-#                         state["start_side"] = region
-#                         state["entered_roi"] = False
-#                     elif region == state["start_side"] and state["entered_roi"]:
-#                         state["entered_roi"] = False
+#                 # Display-only: draw bbox only (no mask fill, no ID text).
+#                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+#                 cv2.putText(frame, cls_name, (x1, max(20, y1 - 8)),
+#                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
 
-#                 color = get_class_color(cls_name)
-#                 frame[mask] = frame[mask] * 0.5 + np.array(color) * 0.5
-
-#                 cv2.putText(frame, f"{cls_name} ID:{tid}",
-#                             (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-#             # Draw ROI box used for counting
-#             cv2.rectangle(frame, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 255, 255), 2)
+#             # Show both conveyor lines on display.
+#             cv2.line(frame, (p1x, p1y), (p2x, p2y), (0, 255, 255), 2)
+#             cv2.putText(frame, "Conveyor 1", (p1x, max(20, p1y - 8)),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+#             cv2.line(frame, (p3x, p3y), (p4x, p4y), (255, 255, 0), 2)
+#             cv2.putText(frame, "Conveyor 2", (p3x, max(20, p3y - 8)),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
 #             y = 40
-#             for cls in count_in:
+#             for cls in count_out_c1:
 #                 draw_text_with_gold_box(
 #                     frame,
-#                     f"{cls} IN:{count_in[cls]} OUT:{count_out[cls]}",
+#                     f"{cls}",
 #                     (15, y),
 #                     get_class_color(cls)
 #                 )
-#                 y += 34
+#                 y += 30
+#                 draw_text_with_gold_box(
+#                     frame,
+#                     f"C1_OUT:{count_out_c1[cls]}",
+#                     (15, y),
+#                     get_class_color(cls)
+#                 )
+#                 y += 30
+#                 draw_text_with_gold_box(
+#                     frame,
+#                     f"C2_OUT:{count_out_c2[cls]}",
+#                     (15, y),
+#                     get_class_color(cls)
+#                 )
+#                 y += 36
 
 #             if raw_writer is None:
 #                 h, w = frame.shape[:2]
@@ -1890,14 +1972,21 @@ if __name__ == "__main__":
 #     parser.add_argument("--project", default="runs/seg-count")
 #     parser.add_argument("--name", default="exp")
 #     parser.add_argument("--axis", choices=["x", "y"], default="y", help="x=vertical line, y=horizontal line")
-#     parser.add_argument("--roi-x1", type=int, default=ROI_X1, help="ROI left x")
-#     parser.add_argument("--roi-y1", type=int, default=ROI_Y1, help="ROI top y")
-#     parser.add_argument("--roi-x2", type=int, default=ROI_X2, help="ROI right x")
-#     parser.add_argument("--roi-y2", type=int, default=ROI_Y2, help="ROI bottom y")
-#     parser.add_argument("--draw-roi", action="store_true", help="draw ROI with mouse on first frame")
+#     parser.add_argument("--line-p1-x", type=int, default=LINE_P1_X, help="line point 1 x")
+#     parser.add_argument("--line-p1-y", type=int, default=LINE_P1_Y, help="line point 1 y")
+#     parser.add_argument("--line-p2-x", type=int, default=LINE_P2_X, help="line point 2 x")
+#     parser.add_argument("--line-p2-y", type=int, default=LINE_P2_Y, help="line point 2 y")
+#     parser.add_argument("--line-p3-x", type=int, default=LINE_P3_X, help="line point 3 x (conveyor 2)")
+#     parser.add_argument("--line-p3-y", type=int, default=LINE_P3_Y, help="line point 3 y (conveyor 2)")
+#     parser.add_argument("--line-p4-x", type=int, default=LINE_P4_X, help="line point 4 x (conveyor 2)")
+#     parser.add_argument("--line-p4-y", type=int, default=LINE_P4_Y, help="line point 4 y (conveyor 2)")
+#     parser.add_argument("--draw-line", action="store_true", help="draw 2-point line with mouse on first frame")
 #     return parser.parse_args()
 
 
 # if __name__ == "__main__":
 #     opt = parse_opt()
 #     run(**vars(opt))
+
+
+
