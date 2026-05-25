@@ -20,6 +20,9 @@ body {
   border-bottom: 1px solid rgba(34, 211, 238, 0.25);
 }
 .logo-strip { display: flex; gap: 10px; }
+.left-logo { justify-content: flex-start; }
+.right-logo { justify-content: flex-end; }
+.header-center { text-align: center; }
 .logo-img {
   width: 130px;
   height: 52px;
@@ -30,7 +33,7 @@ body {
   padding: 4px;
 }
 .dashboard-title { text-align: center; margin: 0; font-size: 1.5rem; }
-.header-time { text-align: right; font-weight: 700; color: var(--cyan); }
+.header-time { margin-top: 4px; text-align: center; font-weight: 700; color: var(--cyan); }
 .main-grid { display: grid; grid-template-columns: 80% 20%; gap: 12px; padding: 12px; min-height: 0; }
 .video-panel { min-height: 0; display: flex; flex-direction: column; }
 .video-toolbar { margin-bottom: 8px; display: flex; gap: 8px; align-items: center; }
@@ -107,5 +110,6 @@ body {
 @media (max-width: 768px) {
   .top-header { grid-template-columns: 1fr; gap: 6px; padding: 10px; height: auto; }
   .dashboard-wrap { grid-template-rows: auto 1fr 44px; }
-  .dashboard-title, .header-time { text-align: left; }
+  .logo-strip, .left-logo, .right-logo { justify-content: center; }
+  .dashboard-title, .header-time { text-align: center; }
 }

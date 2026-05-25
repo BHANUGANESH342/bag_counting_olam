@@ -1,9 +1,12 @@
 import argparse
+import atexit
 import csv
 import os
+import signal
 import sys
 import threading
 import time
+import webbrowser
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,7 +16,9 @@ import cv2
 import numpy as np
 import pathlib
 import torch
+import ctypes
 from flask import Flask, Response, jsonify, render_template, send_file
+from PIL import ImageGrab
 
 try:
     import psutil
@@ -166,6 +171,12 @@ class InferenceEngine:
             self.csv_writer.writerow(["timestamp", "conveyor_id", "tracker_id"])
         self.snapshot_dir = self.run_dir / "snapshots"
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        self.video_dir = self.run_dir / "videos"
+        self.video_dir.mkdir(parents=True, exist_ok=True)
+        suffix = "screen" if args.save_mode == "screen" else "inference"
+        self.video_path = self.video_dir / f"{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+        self.video_writer = None
+        self.output_frame_size = None
 
         self.c1_tracker = ConveyorTracker("C1", args.track_timeout, args.match_dist)
         self.c2_tracker = ConveyorTracker("C2", args.track_timeout, args.match_dist)
@@ -205,139 +216,184 @@ class InferenceEngine:
         self.thread.start()
 
     def _run_loop(self):
-        device_obj = select_device(self.args.device)
-        self.device_name = str(device_obj)
-        model = DetectMultiBackend(self.args.weights, device=device_obj)
-        stride, names = model.stride, model.names
-        imgsz = check_img_size(self.args.imgsz, s=stride)
-        model.warmup(imgsz=(1, 3, imgsz, imgsz))
-        is_webcam = self.args.source.isnumeric()
-        dataset = LoadStreams(self.args.source, img_size=imgsz, stride=stride) if is_webcam else LoadImages(self.args.source, img_size=imgsz, stride=stride)
+        try:
+            if not torch.cuda.is_available():
+                raise RuntimeError("GPU is required, but CUDA is not available on this system.")
+            if str(self.args.device).lower() == "cpu":
+                raise RuntimeError("GPU-only mode: --device cpu is not allowed. Use --device 0 (or another CUDA device id).")
 
-        prev_t = time.time()
-        while not self.stop_flag:
-            if not self.running:
-                time.sleep(0.1)
-                continue
+            device_obj = select_device(self.args.device)
+            if "cpu" in str(device_obj).lower():
+                raise RuntimeError(f"GPU-only mode: selected device is '{device_obj}'. Please set a valid CUDA device (for example, --device 0).")
+            self.device_name = str(device_obj)
+            model = DetectMultiBackend(self.args.weights, device=device_obj)
+            stride, names = model.stride, model.names
+            imgsz = check_img_size(self.args.imgsz, s=stride)
+            model.warmup(imgsz=(1, 3, imgsz, imgsz))
+            is_webcam = self.args.source.isnumeric()
+            dataset = LoadStreams(self.args.source, img_size=imgsz, stride=stride) if is_webcam else LoadImages(self.args.source, img_size=imgsz, stride=stride)
 
-            for data in dataset:
-                if self.stop_flag:
-                    break
+            prev_t = time.time()
+            while not self.stop_flag:
                 if not self.running:
-                    break
+                    time.sleep(0.1)
+                    continue
 
-                t0 = time.time()
-                _, im, im0s, _, _ = data
-                self.frame_idx += 1
-                frame = im0s[0].copy() if isinstance(im0s, list) else im0s.copy()
+                for data in dataset:
+                    if self.stop_flag:
+                        break
+                    if not self.running:
+                        break
 
-                if self.c1_poly is None or self.c2_poly is None:
-                    h, w = frame.shape[:2]
-                    self.c1_poly = self._parse_roi(self.args.c1_roi, w, h)
-                    self.c2_poly = self._parse_roi(self.args.c2_roi, w, h)
+                    t0 = time.time()
+                    _, im, im0s, _, _ = data
+                    self.frame_idx += 1
+                    frame = im0s[0].copy() if isinstance(im0s, list) else im0s.copy()
+
+                    if self.video_writer is None:
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        if self.args.save_mode == "screen":
+                            if self.args.screen_region is None:
+                                time.sleep(max(0.0, float(self.args.selection_delay)))
+                                self.args.screen_region = select_screen_region_interactive()
+                            sw, sh = self.args.device_screen_size
+                            self.output_frame_size = (int(sw), int(sh))
+                            self.video_writer = cv2.VideoWriter(str(self.video_path), fourcc, self.args.save_fps, self.output_frame_size)
+                        else:
+                            h, w = frame.shape[:2]
+                            self.output_frame_size = (int(w), int(h))
+                            self.video_writer = cv2.VideoWriter(str(self.video_path), fourcc, self.args.save_fps, self.output_frame_size)
+                        self.add_event(f"Video recording started: {self.video_path}")
+
                     if self.c1_poly is None or self.c2_poly is None:
-                        self.c1_poly, self.c2_poly = self._default_rois(w, h)
-                        self.add_event("Using default ROI polygons")
-                    else:
-                        self.add_event("Loaded ROI polygons from CLI arguments")
+                        h, w = frame.shape[:2]
+                        self.c1_poly = self._parse_roi(self.args.c1_roi, w, h)
+                        self.c2_poly = self._parse_roi(self.args.c2_roi, w, h)
+                        if self.c1_poly is None or self.c2_poly is None:
+                            self.c1_poly, self.c2_poly = self._default_rois(w, h)
+                            self.add_event("Using default ROI polygons")
+                        else:
+                            self.add_event("Loaded ROI polygons from CLI arguments")
 
-                im_tensor = torch.from_numpy(im).to(device_obj).float() / 255.0
-                if im_tensor.ndim == 3:
-                    im_tensor = im_tensor[None]
+                    im_tensor = torch.from_numpy(im).to(device_obj).float() / 255.0
+                    if im_tensor.ndim == 3:
+                        im_tensor = im_tensor[None]
 
-                with torch.no_grad():
-                    pred, proto = model(im_tensor, augment=False, visualize=False)[:2]
-                    pred = non_max_suppression(pred, self.args.conf_thres, self.args.iou_thres, nm=32)
+                    with torch.no_grad():
+                        pred, proto = model(im_tensor, augment=False, visualize=False)[:2]
+                        pred = non_max_suppression(pred, self.args.conf_thres, self.args.iou_thres, nm=32)
 
-                detections = []
-                if len(pred[0]):
-                    pred[0][:, :4] = scale_boxes(im_tensor.shape[2:], pred[0][:, :4], frame.shape).round()
-                    masks = process_mask(proto[0], pred[0][:, 6:], pred[0][:, :4], frame.shape[:2], upsample=True)
-                    for i, (*xyxy, conf, cls_idx) in enumerate(pred[0][:, :6]):
-                        x1, y1, x2, y2 = map(int, xyxy)
-                        cls_name = names[int(cls_idx)]
-                        mask = masks[i]
-                        if isinstance(mask, torch.Tensor):
-                            mask = mask.detach().cpu().numpy()
-                        mask_bool = mask.astype(bool)
-                        centroid = centroid_from_mask_or_box(mask_bool, (x1, y1, x2, y2))
-                        detections.append(
-                            {
-                                "bbox": (x1, y1, x2, y2),
-                                "cls_name": cls_name,
-                                "mask": mask_bool,
-                                "centroid": centroid,
-                                "conf": float(conf.item()),
-                            }
-                        )
+                    detections = []
+                    if len(pred[0]):
+                        pred[0][:, :4] = scale_boxes(im_tensor.shape[2:], pred[0][:, :4], frame.shape).round()
+                        masks = process_mask(proto[0], pred[0][:, 6:], pred[0][:, :4], frame.shape[:2], upsample=True)
+                        for i, (*xyxy, conf, cls_idx) in enumerate(pred[0][:, :6]):
+                            x1, y1, x2, y2 = map(int, xyxy)
+                            cls_name = names[int(cls_idx)]
+                            mask = masks[i]
+                            if isinstance(mask, torch.Tensor):
+                                mask = mask.detach().cpu().numpy()
+                            mask_bool = mask.astype(bool)
+                            centroid = centroid_from_mask_or_box(mask_bool, (x1, y1, x2, y2))
+                            detections.append(
+                                {
+                                    "bbox": (x1, y1, x2, y2),
+                                    "cls_name": cls_name,
+                                    "mask": mask_bool,
+                                    "centroid": centroid,
+                                    "conf": float(conf.item()),
+                                }
+                            )
 
-                c1_dets, c2_dets = [], []
-                for d in detections:
-                    if point_in_polygon(d["centroid"], self.c1_poly):
-                        c1_dets.append(d)
-                    if point_in_polygon(d["centroid"], self.c2_poly):
-                        c2_dets.append(d)
+                    c1_dets, c2_dets = [], []
+                    for d in detections:
+                        if point_in_polygon(d["centroid"], self.c1_poly):
+                            c1_dets.append(d)
+                        if point_in_polygon(d["centroid"], self.c2_poly):
+                            c2_dets.append(d)
 
-                self.c1_tracker.update(c1_dets, self.frame_idx)
-                self.c2_tracker.update(c2_dets, self.frame_idx)
+                    self.c1_tracker.update(c1_dets, self.frame_idx)
+                    self.c2_tracker.update(c2_dets, self.frame_idx)
 
-                for tid, st in self.c1_tracker.tracks.items():
-                    if st.last_seen == self.frame_idx and not st.counted and self.c1_tracker.mark_counted(tid):
-                        self.csv_writer.writerow([datetime.now().isoformat(timespec="seconds"), "C1", tid])
-                        self.csv_file.flush()
-                        self.add_event(f"{tid} Counted")
-                for tid, st in self.c2_tracker.tracks.items():
-                    if st.last_seen == self.frame_idx and not st.counted and self.c2_tracker.mark_counted(tid):
-                        self.csv_writer.writerow([datetime.now().isoformat(timespec="seconds"), "C2", tid])
-                        self.csv_file.flush()
-                        self.add_event(f"{tid} Counted")
+                    for tid, st in self.c1_tracker.tracks.items():
+                        if st.last_seen == self.frame_idx and not st.counted and self.c1_tracker.mark_counted(tid):
+                            self.csv_writer.writerow([datetime.now().isoformat(timespec="seconds"), "C1", tid])
+                            self.csv_file.flush()
+                            self.add_event(f"{tid} Counted")
+                    for tid, st in self.c2_tracker.tracks.items():
+                        if st.last_seen == self.frame_idx and not st.counted and self.c2_tracker.mark_counted(tid):
+                            self.csv_writer.writerow([datetime.now().isoformat(timespec="seconds"), "C2", tid])
+                            self.csv_file.flush()
+                            self.add_event(f"{tid} Counted")
 
-                overlay = frame.copy()
+                    overlay = frame.copy()
                 # for d in detections:
                 #     color = get_class_color(d["cls_name"])
                 #     overlay[d["mask"]] = (0.62 * overlay[d["mask"]] + 0.38 * np.array(color)).astype(np.uint8)
                 # frame = overlay
 
-                for d in detections:
-                    x1, y1, x2, y2 = d["bbox"]
-                    color = get_class_color(d["cls_name"])
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame, d["cls_name"], (x1, max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+                    for d in detections:
+                        x1, y1, x2, y2 = d["bbox"]
+                        color = get_class_color(d["cls_name"])
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(frame, d["cls_name"], (x1, max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
 
-                for tid, st in self.c1_tracker.tracks.items():
-                    if st.last_seen != self.frame_idx:
-                        continue
-                    cv2.circle(frame, st.centroid, 4, (0, 255, 255), -1)
-                    cv2.putText(frame, tid, (st.bbox[0], max(20, st.bbox[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
-                for tid, st in self.c2_tracker.tracks.items():
-                    if st.last_seen != self.frame_idx:
-                        continue
-                    cv2.circle(frame, st.centroid, 4, (255, 255, 0), -1)
-                    cv2.putText(frame, tid, (st.bbox[0], max(20, st.bbox[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2, cv2.LINE_AA)
+                    for tid, st in self.c1_tracker.tracks.items():
+                        if st.last_seen != self.frame_idx:
+                            continue
+                        cv2.circle(frame, st.centroid, 4, (0, 255, 255), -1)
+                        cv2.putText(frame, tid, (st.bbox[0], max(20, st.bbox[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
+                    for tid, st in self.c2_tracker.tracks.items():
+                        if st.last_seen != self.frame_idx:
+                            continue
+                        cv2.circle(frame, st.centroid, 4, (255, 255, 0), -1)
+                        cv2.putText(frame, tid, (st.bbox[0], max(20, st.bbox[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2, cv2.LINE_AA)
 
-                draw_polygon(frame, self.c1_poly, (0, 255, 255), "Conveyor 1 ROI")
-                draw_polygon(frame, self.c2_poly, (255, 255, 0), "Conveyor 2 ROI")
+                    draw_polygon(frame, self.c1_poly, (0, 255, 255), "Conveyor 1 ROI")
+                    draw_polygon(frame, self.c2_poly, (0, 165, 255), "Conveyor 2 ROI")
 
-                now_t = time.time()
-                dt = max(now_t - prev_t, 1e-6)
-                prev_t = now_t
-                self.last_fps = 1.0 / dt
-                self.inference_speed_ms = (time.time() - t0) * 1000.0
-                self.total_detections = len(detections)
+                    now_t = time.time()
+                    dt = max(now_t - prev_t, 1e-6)
+                    prev_t = now_t
+                    self.last_fps = 1.0 / dt
+                    self.inference_speed_ms = (time.time() - t0) * 1000.0
+                    self.total_detections = len(detections)
 
-                cv2.putText(frame, f"FPS: {self.last_fps:.1f}", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
-                cv2.putText(frame, f"Active IDs: {len(self.c1_tracker.tracks) + len(self.c2_tracker.tracks)}", (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
-                cv2.putText(frame, f"Detections: {len(detections)}", (20, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 210, 255), 2, cv2.LINE_AA)
+                    cv2.putText(frame, f"FPS: {self.last_fps:.1f}", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(frame, f"Active IDs: {len(self.c1_tracker.tracks) + len(self.c2_tracker.tracks)}", (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
+                    cv2.putText(frame, f"Detections: {len(detections)}", (20, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 210, 255), 2, cv2.LINE_AA)
+                    if self.video_writer is not None:
+                        if self.args.save_mode == "screen":
+                            x, y, w, h = self.args.screen_region
+                            bbox = (x, y, x + w, y + h)
+                            screen_img = ImageGrab.grab(bbox=bbox)
+                            screen_frame = cv2.cvtColor(np.array(screen_img), cv2.COLOR_RGB2BGR)
+                            if self.output_frame_size and (screen_frame.shape[1], screen_frame.shape[0]) != self.output_frame_size:
+                                screen_frame = cv2.resize(screen_frame, self.output_frame_size, interpolation=cv2.INTER_AREA)
+                            self.video_writer.write(screen_frame)
+                        else:
+                            self.video_writer.write(frame)
 
-                _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                with self.lock:
-                    self.last_frame = frame
-                    self.last_jpeg = jpeg.tobytes()
+                    _, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                    with self.lock:
+                        self.last_frame = frame
+                        self.last_jpeg = jpeg.tobytes()
 
-            if not is_webcam:
-                break
-
-        self.csv_file.close()
+                if not is_webcam:
+                    break
+        finally:
+            try:
+                self.csv_file.flush()
+                self.csv_file.close()
+            except Exception:
+                pass
+            if self.video_writer is not None:
+                try:
+                    self.video_writer.release()
+                except Exception:
+                    pass
+            print(f"[OUTPUT] CSV saved at: {self.csv_path}")
+            print(f"[OUTPUT] Video saved at: {self.video_path}")
 
     def get_stats(self):
         with self.lock:
@@ -415,6 +471,7 @@ def create_app(args):
     app = Flask(__name__, template_folder="templates", static_folder="static")
     engine = InferenceEngine(args)
     engine.start()
+    app.config["engine"] = engine
 
     @app.route("/")
     def index():
@@ -467,7 +524,7 @@ def parse_opt():
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--conf-thres", type=float, default=0.25)
     parser.add_argument("--iou-thres", type=float, default=0.45)
-    parser.add_argument("--device", default="", help="cuda device id or cpu")
+    parser.add_argument("--device", default="0", help="CUDA device id (GPU-only mode, e.g. 0)")
     parser.add_argument("--project", default="runs/seg-dashboard", help="Output directory")
     parser.add_argument("--name", default="exp", help="Run name inside project directory")
     parser.add_argument("--track-timeout", type=int, default=90)
@@ -479,15 +536,100 @@ def parse_opt():
     )
     parser.add_argument(
         "--c2-roi",
-        default="1071,68;1127,315;1261,296;1237,71",
+        default="1071,80;1090,320;1240,290;1237,80",
         help="Conveyor2 ROI: x1,y1;x2,y2;x3,y3;x4,y4",
     )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--save-fps", type=float, default=20.0, help="Saved output video FPS")
+    parser.add_argument("--save-mode", choices=["inference", "screen"], default="inference", help="Save inference output or selected screen region")
+    parser.add_argument("--screen-region", default="", help="Screen region for screen mode: x,y,w,h")
+    parser.add_argument("--select-screen-region", action="store_true", help="Select screen region interactively after localhost opens")
+    parser.add_argument("--browser-open-delay", type=float, default=1.2, help="Delay in seconds before opening localhost in browser")
+    parser.add_argument("--selection-delay", type=float, default=2.0, help="Delay in seconds before showing selection tool")
     return parser.parse_args()
+
+
+def resolve_screen_region(options):
+    if options.save_mode != "screen":
+        return (0, 0, 0, 0)
+
+    if options.select_screen_region:
+        return None
+
+    if options.screen_region:
+        vals = [int(v.strip()) for v in options.screen_region.split(",")]
+        if len(vals) != 4 or vals[2] <= 0 or vals[3] <= 0:
+            raise ValueError("--screen-region must be x,y,w,h with w>0 and h>0")
+        return tuple(vals)
+
+    raise ValueError("Screen mode requires --select-screen-region or --screen-region x,y,w,h")
+
+
+def select_screen_region_interactive():
+    hwnd = None
+    shown_state = 0
+    if os.name == "nt":
+        try:
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                shown_state = int(ctypes.windll.user32.IsWindowVisible(hwnd))
+                if shown_state:
+                    ctypes.windll.user32.ShowWindow(hwnd, 6)
+                    time.sleep(0.4)
+        except Exception:
+            hwnd = None
+            shown_state = 0
+
+    full = ImageGrab.grab(all_screens=True)
+    preview = cv2.cvtColor(np.array(full), cv2.COLOR_RGB2BGR)
+    win = "Select screen region and press ENTER"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    roi = cv2.selectROI(win, preview, fromCenter=False, showCrosshair=True)
+    cv2.destroyWindow(win)
+
+    if os.name == "nt" and hwnd and shown_state:
+        hwnd = None
+        try:
+            ctypes.windll.user32.ShowWindow(hwnd, 9)
+        except Exception:
+            pass
+
+    x, y, w, h = map(int, roi)
+    if w <= 0 or h <= 0:
+        raise ValueError("No valid screen region selected.")
+    print(f"[OUTPUT] Selected screen region: x={x}, y={y}, w={w}, h={h}")
+    return (x, y, w, h)
+
+
+def get_device_screen_size():
+    if os.name == "nt":
+        try:
+            user32 = ctypes.windll.user32
+            return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+        except Exception:
+            pass
+    return 1920, 1080
 
 
 if __name__ == "__main__":
     options = parse_opt()
+    options.screen_region = resolve_screen_region(options)
+    options.device_screen_size = get_device_screen_size()
     app = create_app(options)
-    app.run(host=options.host, port=options.port, threaded=True, debug=False)
+    engine = app.config["engine"]
+    url = f"http://127.0.0.1:{options.port}/"
+
+    def _graceful_exit(*_):
+        engine.shutdown()
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _graceful_exit)
+    signal.signal(signal.SIGTERM, _graceful_exit)
+    atexit.register(engine.shutdown)
+    threading.Timer(max(0.0, float(options.browser_open_delay)), lambda: webbrowser.open(url)).start()
+    try:
+        app.run(host=options.host, port=options.port, threaded=True, debug=False)
+    finally:
+        engine.shutdown()
