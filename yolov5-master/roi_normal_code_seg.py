@@ -588,4 +588,4 @@ if __name__ == "__main__":
     run(**vars(opt))
 
 # Example:
-# python seg_roi_counter.py --weights model.pt --source video.mp4 --conf-thres 0.60
+# python roi_normal_code_seg.py  --imgsz 640 --weights "C:\Users\admin\Downloads\olam_vid_2_seg_.pt" --conf-thres 0.60 --project "D:\bhanu\olam_agri\ai_infernces" --name "olam_agri_v1_" --source "D:\bhanu\OneDrive - Imagevision.ai India Pvt Ltd\bhanu_iv061\Packaging\Olamagri\engineering\input_videos\olam_client_video_v2.mp4" --device 0
